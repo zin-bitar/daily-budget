@@ -233,6 +233,8 @@ const ROWS_PER_COL = 15;
 
 let expenses = JSON.parse(localStorage.getItem(DATA_KEY) || '[]');
 let pendingOps = JSON.parse(localStorage.getItem(OPS_KEY) || '[]');
+let syncing = false;
+let syncQueued = false;
 
 // ask the browser not to evict our data under storage pressure
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
@@ -347,9 +349,6 @@ function setSyncStatus(cls, text) {
   document.getElementById('syncDot').className = cls;
   document.getElementById('syncText').textContent = text;
 }
-
-let syncing = false;
-let syncQueued = false;
 
 async function sync() {
   if (!ghToken()) return;
