@@ -13,6 +13,7 @@
     --muted: #8a8f98;
     --green: #4ade80;
     --red: #f87171;
+    --yellow: #fbbf24;
     --line: #24272e;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -92,6 +93,31 @@
   }
   #tools button:hover { color: var(--text); }
 
+  /* ---------- sync ---------- */
+  #syncBar { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  #syncDot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+  #syncDot.on { background: var(--green); }
+  #syncDot.err { background: var(--red); }
+  #syncDot.busy { background: var(--yellow); }
+  #syncBar button {
+    background: none; border: none; color: var(--green);
+    font-size: 12px; cursor: pointer; padding: 0; text-decoration: underline;
+  }
+  #syncForm { display: none; flex-direction: column; gap: 8px; }
+  #syncForm.open { display: flex; }
+  #syncForm input {
+    background: var(--panel); border: 1px solid var(--line);
+    color: var(--text); padding: 8px 10px; border-radius: 8px;
+    font-size: 12px; outline: none; width: 100%;
+  }
+  #syncForm .help { font-size: 11px; color: var(--muted); line-height: 1.5; }
+  #syncForm .help a { color: var(--green); }
+  #syncForm button {
+    background: var(--panel); border: 1px solid var(--line); color: var(--text);
+    padding: 7px; border-radius: 8px; font-size: 12px; cursor: pointer;
+  }
+  #syncErr { color: var(--red); font-size: 11px; }
+
   /* ---------- expense columns ---------- */
   #cols {
     flex: 1;
@@ -137,7 +163,6 @@
     body { overflow: auto; }
     #app.open { flex-direction: column; height: auto; }
     #left { flex: none; }
-    #balance { font-size: 56px; }
     #cols { flex-direction: column; }
     .col.scroll { overflow: visible; }
   }
@@ -161,6 +186,24 @@
       <input id="price" type="number" placeholder="Price" step="0.01" min="0.01" required>
       <button type="submit">Add expense</button>
     </form>
+    <div id="syncBar">
+      <span id="syncDot"></span>
+      <span id="syncText">Sync off — data only on this device</span>
+      <button id="syncToggle" type="button">Set up</button>
+    </div>
+    <div id="syncForm">
+      <div class="help">
+        Paste a GitHub token to back up your expenses to your private
+        <b>daily-budget-data</b> repo. Create one
+        <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">here</a>:
+        set <i>Repository access</i> → Only select repositories → <b>daily-budget-data</b>,
+        and under <i>Permissions</i> set <b>Contents</b> to <i>Read and write</i>.
+        Pick the longest expiration. You only do this once per device.
+      </div>
+      <input id="tokenInput" type="password" placeholder="github_pat_…" autocomplete="off">
+      <div id="syncErr"></div>
+      <button id="tokenSave" type="button">Connect</button>
+    </div>
     <div id="tools">
       <button id="exportBtn" type="button">Export backup</button>
       <button id="importBtn" type="button">Import backup</button>
@@ -180,11 +223,19 @@
 const PW_HASH = '57179fb28d54fa91aa54df18c459187399306a706a7c19fd0cdc885260baa06a';
 const AUTH_KEY = 'bt_auth';
 const DATA_KEY = 'bt_expenses';
+const OPS_KEY = 'bt_pending';
+const TOKEN_KEY = 'bt_token';
+const DATA_REPO = 'zin-bitar/daily-budget-data';
+const DATA_FILE = 'expenses.json';
 const START = new Date(2026, 5, 12); // June 12, 2026 (local time) — day 1
 const DAILY = 25;
 const ROWS_PER_COL = 15;
 
 let expenses = JSON.parse(localStorage.getItem(DATA_KEY) || '[]');
+let pendingOps = JSON.parse(localStorage.getItem(OPS_KEY) || '[]');
+
+// ask the browser not to evict our data under storage pressure
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
 
 async function sha256(str) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
@@ -199,6 +250,8 @@ function openApp() {
   lock.style.display = 'none';
   app.classList.add('open');
   render();
+  syncStatusInit();
+  sync();
 }
 
 async function tryUnlock() {
@@ -242,11 +295,145 @@ function updateBalance() {
     `+$${DAILY}/day · day ${daysSinceStart()} · $${spent.toFixed(2)} spent`;
 }
 
-// ---------- expenses ----------
-function save() {
+// ---------- local persistence ----------
+function saveLocal() {
   localStorage.setItem(DATA_KEY, JSON.stringify(expenses));
+  localStorage.setItem(OPS_KEY, JSON.stringify(pendingOps));
 }
 
+// ---------- github sync ----------
+const b64encode = str => {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+};
+const b64decode = str => {
+  const bin = atob(str.replace(/\n/g, ''));
+  return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)));
+};
+
+function ghToken() { return localStorage.getItem(TOKEN_KEY); }
+
+async function ghRequest(method, body) {
+  const res = await fetch(`https://api.github.com/repos/${DATA_REPO}/contents/${DATA_FILE}`, {
+    method,
+    cache: 'no-store',
+    headers: {
+      'Authorization': 'Bearer ' + ghToken(),
+      'Accept': 'application/vnd.github+json',
+      ...(body ? { 'Content-Type': 'application/json' } : {})
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) {
+    const err = new Error('GitHub ' + res.status);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+function applyOps(items, ops) {
+  let out = [...items];
+  for (const op of ops) {
+    if (op.t === 'add' && !out.some(e => e.id === op.item.id)) out.push(op.item);
+    if (op.t === 'del') out = out.filter(e => e.id !== op.id);
+  }
+  return out;
+}
+
+function setSyncStatus(cls, text) {
+  document.getElementById('syncDot').className = cls;
+  document.getElementById('syncText').textContent = text;
+}
+
+let syncing = false;
+let syncQueued = false;
+
+async function sync() {
+  if (!ghToken()) return;
+  if (syncing) { syncQueued = true; return; }
+  syncing = true;
+  setSyncStatus('busy', 'Syncing…');
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const remote = await ghRequest('GET');
+      const remoteItems = JSON.parse(b64decode(remote.content));
+      const merged = applyOps(remoteItems, pendingOps);
+      if (JSON.stringify(merged) !== JSON.stringify(remoteItems)) {
+        try {
+          await ghRequest('PUT', {
+            message: 'update expenses',
+            content: b64encode(JSON.stringify(merged)),
+            sha: remote.sha
+          });
+        } catch (e) {
+          if (e.status === 409 && attempt < 2) continue; // raced another device; refetch and retry
+          throw e;
+        }
+      }
+      expenses = merged;
+      pendingOps = [];
+      saveLocal();
+      render();
+      break;
+    }
+    setSyncStatus('on', 'Synced to GitHub');
+  } catch (e) {
+    const why = (e.status === 401 || e.status === 403) ? 'token invalid or expired'
+              : e.status === 404 ? 'token can’t reach the data repo'
+              : 'offline? will retry';
+    setSyncStatus('err', 'Sync error — ' + why + (pendingOps.length ? ` (${pendingOps.length} unsaved)` : ''));
+  } finally {
+    syncing = false;
+    if (syncQueued) { syncQueued = false; sync(); }
+  }
+}
+
+// retry pending changes every 30s if any failed to upload
+setInterval(() => { if (pendingOps.length) sync(); }, 30000);
+
+// ---------- sync UI ----------
+function syncStatusInit() {
+  if (ghToken()) setSyncStatus('busy', 'Syncing…');
+  else setSyncStatus('', 'Sync off — data only on this device');
+  document.getElementById('syncToggle').textContent = ghToken() ? 'Disconnect' : 'Set up';
+}
+
+document.getElementById('syncToggle').addEventListener('click', () => {
+  if (ghToken()) {
+    localStorage.removeItem(TOKEN_KEY);
+    syncStatusInit();
+  } else {
+    document.getElementById('syncForm').classList.toggle('open');
+  }
+});
+
+document.getElementById('tokenSave').addEventListener('click', async () => {
+  const tok = document.getElementById('tokenInput').value.trim();
+  const errEl = document.getElementById('syncErr');
+  if (!tok) return;
+  errEl.textContent = '';
+  localStorage.setItem(TOKEN_KEY, tok);
+  try {
+    await ghRequest('GET'); // validate
+    // upload anything this device already has
+    pendingOps = expenses.map(e => ({ t: 'add', item: e })).concat(pendingOps);
+    saveLocal();
+    document.getElementById('syncForm').classList.remove('open');
+    document.getElementById('tokenInput').value = '';
+    syncStatusInit();
+    sync();
+  } catch (e) {
+    localStorage.removeItem(TOKEN_KEY);
+    errEl.textContent = e.status === 401 ? 'Token rejected by GitHub — check you copied all of it.'
+      : e.status === 404 ? 'Token works but can’t see daily-budget-data — check Repository access and Contents permission.'
+      : 'Could not reach GitHub — check your connection.';
+  }
+});
+
+// ---------- expenses ----------
 function rowEl(e) {
   const row = document.createElement('div');
   row.className = 'row';
@@ -263,7 +450,8 @@ function rowEl(e) {
   del.title = 'Delete';
   del.addEventListener('click', () => {
     expenses = expenses.filter(x => x.id !== e.id);
-    save(); render();
+    pendingOps.push({ t: 'del', id: e.id });
+    saveLocal(); render(); sync();
   });
   row.append(desc, price, del);
   return row;
@@ -289,8 +477,10 @@ document.getElementById('addForm').addEventListener('submit', e => {
   const desc = document.getElementById('desc').value.trim();
   const price = parseFloat(document.getElementById('price').value);
   if (!desc || !(price > 0)) return;
-  expenses.push({ id: Date.now() + Math.random().toString(36).slice(2), desc, price, ts: Date.now() });
-  save(); render();
+  const item = { id: Date.now() + Math.random().toString(36).slice(2), desc, price, ts: Date.now() };
+  expenses.push(item);
+  pendingOps.push({ t: 'add', item });
+  saveLocal(); render(); sync();
   e.target.reset();
   document.getElementById('desc').focus();
 });
@@ -310,16 +500,19 @@ document.getElementById('importFile').addEventListener('change', async e => {
   try {
     const data = JSON.parse(await file.text());
     if (!Array.isArray(data)) throw new Error('bad format');
-    expenses = data.filter(x => x && typeof x.desc === 'string' && typeof x.price === 'number');
-    save(); render();
+    const valid = data.filter(x => x && typeof x.desc === 'string' && typeof x.price === 'number');
+    expenses = valid;
+    pendingOps = valid.map(x => ({ t: 'add', item: x }));
+    saveLocal(); render(); sync();
   } catch {
     alert('Could not read that backup file.');
   }
   e.target.value = '';
 });
 
-// refresh balance at midnight without reloading
+// refresh balance at midnight without reloading; pull other devices' changes
 setInterval(updateBalance, 60000);
+setInterval(sync, 120000);
 </script>
 </body>
 </html>
