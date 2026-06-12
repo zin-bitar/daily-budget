@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Daily Budget</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💵</text></svg>">
 <style>
   :root {
     --bg: #0e0f12;
@@ -65,7 +66,7 @@
     letter-spacing: -2px; line-height: 1;
     font-variant-numeric: tabular-nums;
     color: var(--green);
-    word-break: break-all;
+    white-space: nowrap;
   }
   #balance.neg { color: var(--red); }
   #sub { color: var(--muted); font-size: 14px; }
@@ -232,7 +233,10 @@ function updateBalance() {
   const spent = expenses.reduce((s, e) => s + e.price, 0);
   const bal = earned - spent;
   const el = document.getElementById('balance');
-  el.textContent = (bal < 0 ? '-$' : '$') + Math.abs(bal).toFixed(2);
+  const text = (bal < 0 ? '-$' : '$') + Math.abs(bal).toFixed(2);
+  el.textContent = text;
+  // shrink the font so long balances stay on one line within the 320px column
+  el.style.fontSize = Math.min(76, Math.floor(520 / text.length)) + 'px';
   el.classList.toggle('neg', bal < 0);
   document.getElementById('sub').textContent =
     `+$${DAILY}/day · day ${daysSinceStart()} · $${spent.toFixed(2)} spent`;
